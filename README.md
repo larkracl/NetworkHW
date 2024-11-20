@@ -6,6 +6,6 @@
 
 수정할 점
 
-1. curl 명령어 사용 시 TCP프로토콜로 인식되는 것이 아닌 HTTP프로토콜로 인식되는 것 고치기<img width="894" alt="image" src="https://github.com/user-attachments/assets/217a2999-0b4d-4094-8e11-2ad9d5f14c70">
+1. curl 명령어 사용 시 TCP프로토콜로 인식되는 것이 아닌 HTTP프로토콜로 인식되는 것 고치기 (원인 : 80번 포트를 사용하는 모든 통신이 HTTP로 등록되는 상황. 이 부분은 어떻게 고칠지 회의가 필요해보임)<img width="894" alt="image" src="https://github.com/user-attachments/assets/217a2999-0b4d-4094-8e11-2ad9d5f14c70">
 
 2. 더블클릭 시 더 자세한 정보를 포함하도록 수정하기<img width="968" alt="image" src="https://github.com/user-attachments/assets/c03a2d92-2807-49f8-83ee-2fcde1972e19">
