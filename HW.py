@@ -50,13 +50,22 @@ def packet_matches_filter(packet, ip_filter, protocol_filter):
 def get_protocol_info(packet):
     """
     패킷의 프로토콜과 추가 정보를 반환합니다.
+    TCP와 HTTP를 구분하기 위해 TCP 페이로드를 검사.
     """
     if ICMP in packet:
         protocol = "ICMP"
         extra_info = f"Type={packet[ICMP].type}, Code={packet[ICMP].code}"
     elif TCP in packet:
         if packet[TCP].sport == 80 or packet[TCP].dport == 80:
-            protocol = "HTTP"
+            # HTTP와 일반 TCP 구분
+            if Raw in packet:
+                payload = packet[Raw].load.decode(errors='ignore')
+                if payload.startswith("GET") or payload.startswith("POST") or "HTTP" in payload:
+                    protocol = "HTTP"
+                else:
+                    protocol = "TCP"
+            else:
+                protocol = "TCP"
             extra_info = f"SrcPort={packet[TCP].sport}, DstPort={packet[TCP].dport}"
         elif DNS in packet:
             protocol = "DNS"
@@ -88,8 +97,9 @@ def get_protocol_info(packet):
     else:
         protocol = "Unknown"
         extra_info = "-"
-    
+
     return protocol, extra_info
+
 
 # 패킷 캡처 콜백 함수
 def packet_callback(packet):
