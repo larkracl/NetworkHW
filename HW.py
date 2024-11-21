@@ -3,6 +3,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
+import struct
+import socket
+from datetime import datetime
 
 # 전역 리스트로 캡처된 패킷 저장
 captured_packets = []
@@ -47,26 +50,101 @@ def packet_matches_filter(packet, ip_filter, protocol_filter):
     # 두 조건 모두 만족할 때만 True 반환
     return ip_match and protocol_match
 
+def compute_checksum(data):
+    """
+    인터넷 체크섬을 계산합니다.
+    """
+    if len(data) % 2:
+        data += b'\x00'
+    checksum = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i+1]
+        checksum += word
+        while checksum > 0xffff:
+            checksum = (checksum & 0xffff) + (checksum >> 16)
+    checksum = ~checksum & 0xffff
+    return checksum
+
+def verify_ip_checksum(ip_layer):
+    """
+    IP 헤더의 체크섬을 검증합니다.
+    """
+    ip_copy = ip_layer.copy()
+    ip_copy.chksum = 0
+    raw_bytes = bytes(ip_copy)[:ip_layer.ihl * 4]
+    computed_checksum = compute_checksum(raw_bytes)
+    return "Good" if computed_checksum == ip_layer.chksum else "Bad"
+
+def verify_icmp_checksum(icmp_layer):
+    """
+    ICMP 체크섬을 검증합니다.
+    """
+    icmp_copy = icmp_layer.copy()
+    icmp_copy.chksum = 0
+    raw_bytes = bytes(icmp_copy)
+    computed_checksum = compute_checksum(raw_bytes)
+    return "Good" if computed_checksum == icmp_layer.chksum else "Bad"
+
+def verify_tcp_checksum(ip_layer, tcp_layer):
+    """
+    TCP 체크섬을 검증합니다.
+    """
+    tcp_copy = tcp_layer.copy()
+    tcp_copy.chksum = 0
+    # Pseudo-header
+    pseudo_header = struct.pack('!4s4sBBH', 
+                                socket.inet_aton(ip_layer.src), 
+                                socket.inet_aton(ip_layer.dst), 
+                                0, 
+                                ip_layer.proto, 
+                                len(tcp_copy))
+    raw_bytes = pseudo_header + bytes(tcp_copy)
+    computed_checksum = compute_checksum(raw_bytes)
+    return "Good" if computed_checksum == tcp_layer.chksum else "Bad"
+
+def verify_udp_checksum(ip_layer, udp_layer):
+    """
+    UDP 체크섬을 검증합니다.
+    """
+    if udp_layer.chksum == 0:
+        return "No Checksum"
+    udp_copy = udp_layer.copy()
+    udp_copy.chksum = 0
+    # Pseudo-header
+    pseudo_header = struct.pack('!4s4sBBH', 
+                                socket.inet_aton(ip_layer.src), 
+                                socket.inet_aton(ip_layer.dst), 
+                                0, 
+                                ip_layer.proto, 
+                                len(udp_copy))
+    raw_bytes = pseudo_header + bytes(udp_copy)
+    computed_checksum = compute_checksum(raw_bytes)
+    return "Good" if computed_checksum == udp_layer.chksum else "Bad"
+
 def get_protocol_info(packet):
     """
     패킷의 프로토콜과 추가 정보를 반환합니다.
-    TCP와 HTTP를 구분하기 위해 TCP 페이로드를 검사.
+    각 프로토콜에 대한 상세 정보를 포함합니다.
     """
     if ICMP in packet:
         protocol = "ICMP"
-        extra_info = f"Type={packet[ICMP].type}, Code={packet[ICMP].code}"
+        # 기본 정보
+        extra_info = f"Type={packet[ICMP].type}, Code={packet[ICMP].code}, Checksum={hex(packet[ICMP].chksum)}"
     elif TCP in packet:
         if packet[TCP].sport == 80 or packet[TCP].dport == 80:
             # HTTP와 일반 TCP 구분
             if Raw in packet:
-                payload = packet[Raw].load.decode(errors='ignore')
-                if payload.startswith("GET") or payload.startswith("POST") or "HTTP" in payload:
-                    protocol = "HTTP"
-                else:
+                try:
+                    payload = packet[Raw].load.decode(errors='ignore')
+                    if payload.startswith("GET") or payload.startswith("POST") or "HTTP" in payload:
+                        protocol = "HTTP"
+                    else:
+                        protocol = "TCP"
+                except:
                     protocol = "TCP"
             else:
                 protocol = "TCP"
-            extra_info = f"SrcPort={packet[TCP].sport}, DstPort={packet[TCP].dport}"
+            extra_info = f"SrcPort={packet[TCP].sport}, DstPort={packet[TCP].dport}, Flags={packet[TCP].flags}, Seq={packet[TCP].seq}, Ack={packet[TCP].ack}"
         elif DNS in packet:
             protocol = "DNS"
             if packet[DNS].qd:
@@ -79,7 +157,7 @@ def get_protocol_info(packet):
                 extra_info = "Response"
         else:
             protocol = "TCP"
-            extra_info = f"SrcPort={packet[TCP].sport}, DstPort={packet[TCP].dport}"
+            extra_info = f"SrcPort={packet[TCP].sport}, DstPort={packet[TCP].dport}, Flags={packet[TCP].flags}, Seq={packet[TCP].seq}, Ack={packet[TCP].ack}"
     elif UDP in packet:
         if DNS in packet:
             protocol = "DNS"
@@ -93,13 +171,11 @@ def get_protocol_info(packet):
                 extra_info = "Response"
         else:
             protocol = "UDP"
-            extra_info = f"SrcPort={packet[UDP].sport}, DstPort={packet[UDP].dport}"
+            extra_info = f"SrcPort={packet[UDP].sport}, DstPort={packet[UDP].dport}, Length={packet[UDP].len}, Checksum={hex(packet[UDP].chksum)}"
     else:
         protocol = "Unknown"
         extra_info = "-"
-
     return protocol, extra_info
-
 
 # 패킷 캡처 콜백 함수
 def packet_callback(packet):
@@ -148,25 +224,62 @@ def show_packet_details(packet, packet_no):
         # 새로운 창에서 상세 정보 표시
         detail_window = tk.Toplevel(root)
         detail_window.title(f"Packet {packet_no} Details")
-        detail_window.geometry("600x400")
+        detail_window.geometry("700x600")
         
         text_area = tk.Text(detail_window, wrap="word", font=("Courier", 10))
         text_area.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # IP 계층 정보
         text_area.insert("1.0", f"Source IP        : {packet[IP].src}\n")
         text_area.insert("end", f"Destination IP   : {packet[IP].dst}\n")
+        text_area.insert("end", f"Version          : {packet[IP].version}\n")
+        text_area.insert("end", f"Header Length    : {packet[IP].ihl * 4} bytes\n")
+        text_area.insert("end", f"Differentiated Services Field: {packet[IP].tos}\n")
+        text_area.insert("end", f"Total Length     : {packet[IP].len}\n")
+        text_area.insert("end", f"Identification   : {hex(packet[IP].id)} ({packet[IP].id})\n")
+        text_area.insert("end", f"Flags            : {packet[IP].flags}\n")
+        text_area.insert("end", f"Fragment Offset  : {packet[IP].frag}\n")
         text_area.insert("end", f"TTL (Time to Live): {packet[IP].ttl}\n")
         text_area.insert("end", f"Protocol         : {packet[IP].proto}\n")
+        # IP 체크섬 상태 표시
+        ip_checksum_status = verify_ip_checksum(packet[IP])
+        text_area.insert("end", f"Checksum         : {hex(packet[IP].chksum)} [{ip_checksum_status}]\n")
         text_area.insert("end", f"Packet Length    : {len(packet)} bytes\n")
         
         # ICMP, TCP, UDP, HTTP 상세 처리
         if ICMP in packet:
-            text_area.insert("end", f"ICMP Type        : {packet[ICMP].type}\n")
-            text_area.insert("end", f"ICMP Code        : {packet[ICMP].code}\n")
+            text_area.insert("end", f"\nInternet Control Message Protocol\n")
+            text_area.insert("end", f"Type             : {packet[ICMP].type} ({icmp_type_description(packet[ICMP].type)})\n")
+            text_area.insert("end", f"Code             : {packet[ICMP].code}\n")
+            # 체크섬 상태 확인 및 표시
+            icmp_checksum_status = verify_icmp_checksum(packet[ICMP])
+            text_area.insert("end", f"Checksum         : {hex(packet[ICMP].chksum)} [{icmp_checksum_status}]\n")
+            # Response frame (패킷 번호 사용)
+            text_area.insert("end", f"[Response frame:] {packet_no}\n")
+            # Data length
+            if Raw in packet:
+                data_length = len(packet[Raw].load)
+                text_area.insert("end", f"Data ({data_length} bytes):\n")
+                # Display data in hexadecimal
+                data_hex = ' '.join(f"{byte:02x}" for byte in packet[Raw].load)
+                text_area.insert("end", f"{data_hex}\n")
+            else:
+                text_area.insert("end", "Data (0 bytes): No Data\n"
+                )
         
         elif TCP in packet:
+            text_area.insert("end", f"\nTCP Header:\n")
             text_area.insert("end", f"Source Port      : {packet[TCP].sport}\n")
             text_area.insert("end", f"Destination Port : {packet[TCP].dport}\n")
+            text_area.insert("end", f"Sequence Number  : {packet[TCP].seq}\n")
+            text_area.insert("end", f"Acknowledgment Number: {packet[TCP].ack}\n")
+            text_area.insert("end", f"Data Offset      : {packet[TCP].dataofs * 4} bytes\n")
             text_area.insert("end", f"Flags            : {packet[TCP].flags}\n")
+            # TCP 체크섬 상태 표시
+            tcp_checksum_status = verify_tcp_checksum(packet[IP], packet[TCP])
+            text_area.insert("end", f"Checksum         : {hex(packet[TCP].chksum)} [{tcp_checksum_status}]\n")
+            text_area.insert("end", f"Window Size      : {packet[TCP].window}\n")
+            text_area.insert("end", f"Urgent Pointer   : {packet[TCP].urgptr}\n")
             if packet[TCP].sport == 80 or packet[TCP].dport == 80:
                 # HTTP는 Raw 데이터에서 추가 정보 추출 가능
                 if Raw in packet:
@@ -174,16 +287,44 @@ def show_packet_details(packet, packet_no):
                         http_payload = packet[Raw].load.decode(errors='ignore')
                         # 간단한 HTTP 요청/응답 파싱 (예: 첫 줄)
                         first_line = http_payload.split('\r\n')[0]
-                        text_area.insert("end", f"HTTP Info        : {first_line}\n")
+                        text_area.insert("end", f"\nHTTP Info:\n{first_line}\n")
                     except:
                         text_area.insert("end", "HTTP Info        : Unable to decode\n")
+                else:
+                    text_area.insert("end", "No HTTP Data\n")
+            else:
+                if Raw in packet:
+                    text_area.insert("end", "\nTCP Payload:\n")
+                    try:
+                        tcp_payload = packet[Raw].load.decode(errors='ignore')
+                        text_area.insert("end", tcp_payload)
+                    except:
+                        text_area.insert("end", "Unable to decode TCP payload.\n")
+                else:
+                    text_area.insert("end", "No TCP Payload\n")
         
         elif UDP in packet:
+            text_area.insert("end", f"\nUDP Header:\n")
             text_area.insert("end", f"Source Port      : {packet[UDP].sport}\n")
             text_area.insert("end", f"Destination Port : {packet[UDP].dport}\n")
+            text_area.insert("end", f"Length           : {packet[UDP].len}\n")
+            # UDP 체크섬 상태 표시
+            udp_checksum_status = verify_udp_checksum(packet[IP], packet[UDP])
+            text_area.insert("end", f"Checksum         : {hex(packet[UDP].chksum)} [{udp_checksum_status}]\n")
+            if Raw in packet:
+                data_length = len(packet[Raw].load)
+                text_area.insert("end", f"Data ({data_length} bytes):\n")
+                try:
+                    udp_payload = packet[Raw].load.decode(errors='ignore')
+                    text_area.insert("end", udp_payload)
+                except:
+                    text_area.insert("end", "Unable to decode UDP payload.\n")
+            else:
+                text_area.insert("end", "Data (0 bytes): No Data\n")
         
         # DNS 추가 정보
         if DNS in packet:
+            text_area.insert("end", f"\nDNS Details:\n")
             if packet[DNS].qd:
                 try:
                     qname = packet[DNS].qd.qname.decode()
@@ -192,20 +333,78 @@ def show_packet_details(packet, packet_no):
                 text_area.insert("end", f"DNS Query        : {qname}\n")
             else:
                 text_area.insert("end", f"DNS Response\n")
+                # Include answers
+                if packet[DNS].an:
+                    for i in range(packet[DNS].ancount):
+                        rr = packet[DNS].an[i]
+                        try:
+                            rrname = rr.rrname.decode()
+                        except:
+                            rrname = "Invalid RR Name"
+                        try:
+                            rdata = rr.rdata.decode()
+                        except:
+                            rdata = str(rr.rdata)
+                        text_area.insert("end", f"Answer {i+1}: {rrname} {rdata}\n")
         
-        # Raw Payload
-        text_area.insert("end", "\nRaw Payload:\n")
-        if Raw in packet:
+        # Raw Payload (기타 프로토콜의 경우)
+        if Raw in packet and not (ICMP in packet or TCP in packet or UDP in packet):
+            text_area.insert("end", "\nRaw Payload:\n")
             try:
                 raw_payload = packet[Raw].load.decode(errors='ignore')
             except:
                 raw_payload = "Invalid Raw Data"
             text_area.insert("end", raw_payload)
-        else:
-            text_area.insert("end", "No Raw Data")
+        
         text_area.config(state="disabled")
     except Exception as e:
         messagebox.showerror("Error", f"Failed to display packet details: {e}")
+
+def icmp_type_description(icmp_type):
+    """
+    ICMP 타입에 대한 설명을 반환합니다.
+    """
+    descriptions = {
+        0: "Echo Reply",
+        3: "Destination Unreachable",
+        4: "Source Quench",
+        5: "Redirect",
+        8: "Echo (ping) request",
+        11: "Time Exceeded",
+        12: "Parameter Problem",
+        13: "Timestamp",
+        14: "Timestamp Reply",
+        17: "Address Mask Request",
+        18: "Address Mask Reply",
+    }
+    return descriptions.get(icmp_type, "Unknown")
+
+def parse_icmp_timestamp(packet, packet_no):
+    """
+    ICMP 데이터에서 타임스탬프를 추출하고 상대 시간을 계산합니다.
+    """
+    timestamp_str = "N/A"
+    relative_time = "N/A"
+    if Raw in packet:
+        try:
+            # Assuming the timestamp is a readable string in the payload
+            payload_str = packet[Raw].load.decode(errors='ignore')
+            # Example: "Timestamp from ICMP data: Nov 11, 2024 18:04:36.000000000 KST"
+            if "Timestamp from ICMP data:" in payload_str:
+                timestamp_part = payload_str.split("Timestamp from ICMP data:")[1].split("\n")[0].strip()
+                timestamp_str = timestamp_part
+                # Parse the timestamp
+                try:
+                    # Remove timezone for parsing
+                    timestamp_dt = datetime.strptime(timestamp_part.split(" KST")[0], "%b %d, %Y %H:%M:%S.%f")
+                    current_time = datetime.now()
+                    delta = current_time - timestamp_dt
+                    relative_time = f"{delta.total_seconds():.9f}"
+                except:
+                    relative_time = "Invalid Timestamp Format"
+        except:
+            pass
+    return timestamp_str, relative_time
 
 # 패킷 캡처 스레드
 def start_sniffing():
@@ -299,7 +498,7 @@ def show_flow_view():
     flow_tree.column("Source", width=150, anchor="center")
     flow_tree.column("Destination", width=150, anchor="center")
     flow_tree.column("Protocol", width=100, anchor="center")
-    flow_tree.column("Type", width=100, anchor="center")
+    flow_tree.column("Type", width=150, anchor="center")
     flow_tree.column("Details", width=350, anchor="w")
     flow_tree.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -308,20 +507,29 @@ def show_flow_view():
         if packet_matches_filter(packet, ip_filter, protocol_filter):
             if IP in packet:
                 protocol, extra_info = get_protocol_info(packet)
+                pkt_type = "-"
+                details = extra_info
                 if ICMP in packet:
-                    pkt_type = "Request" if packet[ICMP].type == 8 else "Reply"
+                    if packet[ICMP].type == 8:
+                        pkt_type = "Request"
+                    elif packet[ICMP].type == 0:
+                        pkt_type = "Reply"
+                    else:
+                        pkt_type = "Other"
                 elif TCP in packet:
-                    if packet[TCP].flags == "S":
+                    flags = packet[TCP].flags
+                    if flags == "S":
                         pkt_type = "SYN"
-                    elif packet[TCP].flags == "SA":
+                    elif flags == "SA":
                         pkt_type = "SYN-ACK"
-                    elif packet[TCP].flags == "F":
+                    elif flags == "F":
                         pkt_type = "FIN"
+                    elif flags == "A":
+                        pkt_type = "ACK"
                     else:
                         pkt_type = "Data"
-                else:
-                    pkt_type = "-"
-                
+                elif UDP in packet:
+                    pkt_type = "Data"
                 flow_tree.insert(
                     "",
                     "end",
@@ -331,7 +539,7 @@ def show_flow_view():
                         packet[IP].dst,
                         protocol,
                         pkt_type,
-                        extra_info
+                        details
                     )
                 )
 
