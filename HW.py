@@ -218,17 +218,174 @@ def stop_sniffing():
     start_btn.config(state="normal")
     stop_btn.config(state="disabled")
 
-# 선택한 패킷의 상세 정보 표시
+# 스트림을 재조립하고 표시하는 함수
+def show_stream(packet, packet_no):
+    protocol = None
+    stream_identifier = None
+    stream_packets = []
+
+    # 스트림 식별자 설정
+    if TCP in packet:
+        protocol = "TCP"
+        stream_identifier = (
+            packet[IP].src,
+            packet[TCP].sport,
+            packet[IP].dst,
+            packet[TCP].dport
+        )
+    elif UDP in packet:
+        protocol = "UDP"
+        stream_identifier = (
+            packet[IP].src,
+            packet[UDP].sport,
+            packet[IP].dst,
+            packet[UDP].dport
+        )
+    elif DNS in packet:
+        protocol = "DNS"
+        stream_identifier = (
+            packet[IP].src,
+            packet[UDP].sport if UDP in packet else packet[TCP].sport,
+            packet[IP].dst,
+            packet[UDP].dport if UDP in packet else packet[TCP].dport
+        )
+    elif ICMP in packet:
+        protocol = "ICMP"
+        stream_identifier = (
+            packet[IP].src,
+            packet[ICMP].id,
+            packet[IP].dst,
+            packet[ICMP].seq
+        )
+    else:
+        protocol = "Unknown"
+
+    if not stream_identifier:
+        messagebox.showinfo("Stream", "Cannot determine stream for this packet.")
+        return
+
+    # 관련 패킷 수집
+    for pkt in captured_packets:
+        if protocol == "TCP":
+            if TCP in pkt:
+                identifier = (
+                    pkt[IP].src,
+                    pkt[TCP].sport,
+                    pkt[IP].dst,
+                    pkt[TCP].dport
+                )
+                # 양방향 스트림을 고려
+                if identifier == stream_identifier or identifier == (
+                    stream_identifier[2],
+                    stream_identifier[3],
+                    stream_identifier[0],
+                    stream_identifier[1]
+                ):
+                    stream_packets.append(pkt)
+        elif protocol == "UDP":
+            if UDP in pkt:
+                identifier = (
+                    pkt[IP].src,
+                    pkt[UDP].sport,
+                    pkt[IP].dst,
+                    pkt[UDP].dport
+                )
+                # 양방향 스트림을 고려
+                if identifier == stream_identifier or identifier == (
+                    stream_identifier[2],
+                    stream_identifier[3],
+                    stream_identifier[0],
+                    stream_identifier[1]
+                ):
+                    stream_packets.append(pkt)
+        elif protocol == "DNS":
+            if DNS in pkt:
+                if UDP in pkt:
+                    identifier = (
+                        pkt[IP].src,
+                        pkt[UDP].sport,
+                        pkt[IP].dst,
+                        pkt[UDP].dport
+                    )
+                elif TCP in pkt:
+                    identifier = (
+                        pkt[IP].src,
+                        pkt[TCP].sport,
+                        pkt[IP].dst,
+                        pkt[TCP].dport
+                    )
+                else:
+                    continue
+                # 양방향 스트림을 고려
+                if identifier == stream_identifier or identifier == (
+                    stream_identifier[2],
+                    stream_identifier[3],
+                    stream_identifier[0],
+                    stream_identifier[1]
+                ):
+                    stream_packets.append(pkt)
+        elif protocol == "ICMP":
+            if ICMP in pkt:
+                identifier = (
+                    pkt[IP].src,
+                    pkt[ICMP].id,
+                    pkt[IP].dst,
+                    pkt[ICMP].seq
+                )
+                # 동일한 스트림 식별자
+                if identifier == stream_identifier:
+                    stream_packets.append(pkt)
+
+    # 스트림 재조립
+    if protocol == "TCP" or protocol == "HTTP":
+        # TCP 스트림: 시퀀스 번호 순으로 페이로드 재조립
+        stream_packets_sorted = sorted(stream_packets, key=lambda p: p[TCP].seq)
+        stream_data = ""
+        for pkt in stream_packets_sorted:
+            if Raw in pkt:
+                try:
+                    payload = pkt[Raw].load.decode(errors='ignore')
+                    stream_data += payload
+                except:
+                    stream_data += "<Unable to decode payload>\n"
+    elif protocol == "UDP" or protocol == "DNS":
+        # UDP/DNS 스트림: 패킷 순서대로 페이로드 나열
+        stream_data = ""
+        for pkt in stream_packets:
+            if Raw in pkt:
+                try:
+                    payload = pkt[Raw].load.decode(errors='ignore')
+                    stream_data += payload + "\n"
+                except:
+                    stream_data += "<Unable to decode payload>\n"
+    elif protocol == "ICMP":
+        # ICMP 스트림: 메시지 순서대로 나열
+        stream_data = ""
+        for pkt in stream_packets:
+            stream_data += f"Type={pkt[ICMP].type}, Code={pkt[ICMP].code}\n"
+    else:
+        stream_data = "Stream not available for this protocol."
+
+    # 스트림 창 생성 및 표시
+    stream_window = tk.Toplevel(root)
+    stream_window.title(f"Stream for Packet {packet_no}")
+    stream_window.geometry("700x500")
+
+    text_area = tk.Text(stream_window, wrap="word", font=("Courier", 10))
+    text_area.pack(fill="both", expand=True, padx=10, pady=10)
+    text_area.insert("1.0", stream_data)
+    text_area.config(state="disabled")
+
 def show_packet_details(packet, packet_no):
     try:
         # 새로운 창에서 상세 정보 표시
         detail_window = tk.Toplevel(root)
         detail_window.title(f"Packet {packet_no} Details")
         detail_window.geometry("700x600")
-        
+
         text_area = tk.Text(detail_window, wrap="word", font=("Courier", 10))
         text_area.pack(fill="both", expand=True, padx=10, pady=10)
-        
+
         # IP 계층 정보
         text_area.insert("1.0", f"Source IP        : {packet[IP].src}\n")
         text_area.insert("end", f"Destination IP   : {packet[IP].dst}\n")
@@ -245,7 +402,7 @@ def show_packet_details(packet, packet_no):
         ip_checksum_status = verify_ip_checksum(packet[IP])
         text_area.insert("end", f"Checksum         : {hex(packet[IP].chksum)} [{ip_checksum_status}]\n")
         text_area.insert("end", f"Packet Length    : {len(packet)} bytes\n")
-        
+
         # ICMP, TCP, UDP, HTTP 상세 처리
         if ICMP in packet:
             text_area.insert("end", f"\nInternet Control Message Protocol\n")
@@ -264,18 +421,17 @@ def show_packet_details(packet, packet_no):
                 data_hex = ' '.join(f"{byte:02x}" for byte in packet[Raw].load)
                 text_area.insert("end", f"{data_hex}\n")
             else:
-                text_area.insert("end", "Data (0 bytes): No Data\n"
-                )
-        
+                text_area.insert("end", "Data (0 bytes): No Data\n")
+
         elif TCP in packet:
-            text_area.insert("end", f"\nTCP Header:\n")
+            text_area.insert("end", f"\nTransmission Control Protocol\n")
             text_area.insert("end", f"Source Port      : {packet[TCP].sport}\n")
             text_area.insert("end", f"Destination Port : {packet[TCP].dport}\n")
             text_area.insert("end", f"Sequence Number  : {packet[TCP].seq}\n")
             text_area.insert("end", f"Acknowledgment Number: {packet[TCP].ack}\n")
             text_area.insert("end", f"Data Offset      : {packet[TCP].dataofs * 4} bytes\n")
             text_area.insert("end", f"Flags            : {packet[TCP].flags}\n")
-            # TCP 체크섬 상태 표시
+            # TCP 체크섬 상태 표시 및 형식 변경
             tcp_checksum_status = verify_tcp_checksum(packet[IP], packet[TCP])
             text_area.insert("end", f"Checksum         : {hex(packet[TCP].chksum)} [{tcp_checksum_status}]\n")
             text_area.insert("end", f"Window Size      : {packet[TCP].window}\n")
@@ -302,13 +458,13 @@ def show_packet_details(packet, packet_no):
                         text_area.insert("end", "Unable to decode TCP payload.\n")
                 else:
                     text_area.insert("end", "No TCP Payload\n")
-        
+
         elif UDP in packet:
-            text_area.insert("end", f"\nUDP Header:\n")
+            text_area.insert("end", f"\nUser Datagram Protocol\n")
             text_area.insert("end", f"Source Port      : {packet[UDP].sport}\n")
             text_area.insert("end", f"Destination Port : {packet[UDP].dport}\n")
             text_area.insert("end", f"Length           : {packet[UDP].len}\n")
-            # UDP 체크섬 상태 표시
+            # UDP 체크섬 상태 표시 및 형식 변경
             udp_checksum_status = verify_udp_checksum(packet[IP], packet[UDP])
             text_area.insert("end", f"Checksum         : {hex(packet[UDP].chksum)} [{udp_checksum_status}]\n")
             if Raw in packet:
@@ -321,10 +477,10 @@ def show_packet_details(packet, packet_no):
                     text_area.insert("end", "Unable to decode UDP payload.\n")
             else:
                 text_area.insert("end", "Data (0 bytes): No Data\n")
-        
+
         # DNS 추가 정보
         if DNS in packet:
-            text_area.insert("end", f"\nDNS Details:\n")
+            text_area.insert("end", f"\nDomain Name System\n")
             if packet[DNS].qd:
                 try:
                     qname = packet[DNS].qd.qname.decode()
@@ -346,7 +502,7 @@ def show_packet_details(packet, packet_no):
                         except:
                             rdata = str(rr.rdata)
                         text_area.insert("end", f"Answer {i+1}: {rrname} {rdata}\n")
-        
+
         # Raw Payload (기타 프로토콜의 경우)
         if Raw in packet and not (ICMP in packet or TCP in packet or UDP in packet):
             text_area.insert("end", "\nRaw Payload:\n")
@@ -355,7 +511,11 @@ def show_packet_details(packet, packet_no):
             except:
                 raw_payload = "Invalid Raw Data"
             text_area.insert("end", raw_payload)
-        
+
+        # "Stream" 버튼 추가
+        stream_btn = tk.Button(detail_window, text="Stream", command=lambda: show_stream(packet, packet_no))
+        stream_btn.pack(side="bottom", pady=10, anchor="e", padx=10)
+
         text_area.config(state="disabled")
     except Exception as e:
         messagebox.showerror("Error", f"Failed to display packet details: {e}")
